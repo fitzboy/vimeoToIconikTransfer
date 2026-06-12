@@ -65,10 +65,11 @@ func downloadVideo(link, name, mime string) error {
 
 func main() {
 	// flags for the username and password for Vimeo, and also the Iconik APPID and AuthToken
-	flag.StringVar(&vimeoAccessToken, "vimeo-access-token", "", "Vimeo access token")
+	flag.StringVar(&vimeoAccessToken, "vimeo-access-token", "7057388dadfc5cfa11f44886450bc5d9", "Vimeo access token")
 	flag.StringVar(&iconikAppID, "iconik-appid", "", "Iconik App ID")
 	flag.StringVar(&iconikAuthToken, "iconik-auth-token", "", "Iconik Auth Token")
 	flag.Parse()
+	// client identifier: c0513fafcbc871f615c846a8f3718572e774c7a6
 
 	/*	if vimeoUsername == "" || vimeoPassword == "" || iconikAppID == "" || iconikAuthToken == "" {
 		fmt.Println("Usage: go run main.go --vimeo-username <username> --vimeo-password <password> --iconik-appid <appid> --iconik-auth-token <auth-token>")
