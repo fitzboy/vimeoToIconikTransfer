@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/silentsokolov/go-vimeo/vimeo"
 	"golang.org/x/oauth2"
@@ -14,20 +17,88 @@ import (
 var vimeoAccessToken string
 var iconikAppID string
 var iconikAuthToken string
+var debugHTTP bool
 
+// debugTransport wraps an http.RoundTripper and logs the outgoing
+// Authorization header for every request. It is injected as the *base*
+// transport inside the oauth2 wrapper, so the header has already been added
+// by the oauth2 layer by the time we see it here.
+type debugTransport struct{ base http.RoundTripper }
+
+func (t *debugTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	auth := req.Header.Get("Authorization")
+	if auth == "" {
+		log.Printf("DEBUG %s %s  →  Authorization header: <not set>", req.Method, req.URL)
+	} else {
+		// Show token type and first 8 chars only so it's identifiable but not fully exposed.
+		preview := auth
+		if len(preview) > 16 {
+			preview = preview[:16] + "…"
+		}
+		log.Printf("DEBUG %s %s  →  Authorization: %s", req.Method, req.URL, preview)
+	}
+	return t.base.RoundTrip(req)
+}
+
+// videoInfo holds all metadata collected for a single video.
+type videoInfo struct {
+	FolderPath    string
+	Name          string
+	UploadedAt    time.Time
+	SourceSize    int
+	SourceLink    string
+	SourceType    string
+	SourceQuality string // "source" if original file available, otherwise best available quality
+	VideoURI      string
+}
+
+// extractSourceInfo returns the best available download entry for a video.
+// Prefers "source" quality (the original upload); falls back to the
+// highest-resolution rendition otherwise.
+func extractSourceInfo(video *vimeo.Video) (link, mimeType string, size int, quality string) {
+	bestWidth := 0
+	for _, dl := range video.Download {
+		if dl.Quality == "source" {
+			return dl.Link, dl.Type, dl.Size, "source"
+		}
+		if dl.Width > bestWidth {
+			bestWidth = dl.Width
+			link = dl.Link
+			mimeType = dl.Type
+			size = dl.Size
+			quality = dl.Quality
+		}
+	}
+	return
+}
+
+// humanSize formats a byte count as a human-readable string (e.g. "1.4 GB").
+func humanSize(bytes int) string {
+	if bytes <= 0 {
+		return "unknown"
+	}
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := unit, 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+// downloadVideo downloads a video file from link to disk as name+extension.
+// Vimeo download links are pre-signed, but we include the bearer token as a
+// fallback. This function is unused in the current inventory phase but is
+// kept ready for the forthcoming download step.
 func downloadVideo(link, name, mime string) error {
 	req, err := http.NewRequest("GET", link, nil)
 	if err != nil {
 		return err
 	}
-
-	// Optionally, set custom headers
-	req.Header.Set("Authorization", "bearer {"+vimeoAccessToken+"}")
-
-	// Inspect the headers being sent
-	for key, value := range req.Header {
-		fmt.Printf("header %s: %s\n", key, value)
-	}
+	req.Header.Set("Authorization", "bearer "+vimeoAccessToken)
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -36,16 +107,18 @@ func downloadVideo(link, name, mime string) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("received status code %d", resp.StatusCode)
 	}
-	extension := ""
-	if mime == "video/mp4" {
+
+	var extension string
+	switch mime {
+	case "video/mp4":
 		extension = ".mp4"
-	} else if mime == "video/quicktime" {
+	case "video/quicktime":
 		extension = ".mov"
-	} else {
-		return fmt.Errorf("Unsupported video type:", mime)
+	default:
+		return fmt.Errorf("unsupported video type: %s", mime)
 	}
 
 	outFile, err := os.Create(name + extension)
@@ -54,87 +127,194 @@ func downloadVideo(link, name, mime string) error {
 	}
 	defer outFile.Close()
 
-	_, err = outFile.ReadFrom(resp.Body)
-	if err != nil {
+	if _, err = io.Copy(outFile, resp.Body); err != nil {
 		return fmt.Errorf("error writing to file: %w", err)
 	}
 
-	fmt.Println("Video downloaded successfully.")
+	return nil
+}
+
+// listAllRootFolders paginates through all root-level folders for the
+// authenticated user, stopping when the API signals no next page.
+func listAllRootFolders(client *vimeo.Client) ([]*vimeo.Folder, error) {
+	var all []*vimeo.Folder
+	for page := 1; ; page++ {
+		folders, resp, err := client.Users.ListFolders(
+			"",
+			vimeo.OptPerPage(100),
+			vimeo.OptPage(page),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("listing root folders page %d: %w", page, err)
+		}
+		all = append(all, folders...)
+		if resp.NextPage == "" {
+			break
+		}
+	}
+	return all, nil
+}
+
+// listAllFolderVideos paginates through all videos in a folder,
+// stopping when the API signals no next page.
+func listAllFolderVideos(client *vimeo.Client, folderURI string) ([]*vimeo.Video, error) {
+	var all []*vimeo.Video
+	for page := 1; ; page++ {
+		vids, resp, err := client.Users.ListFolderVideos(
+			folderURI,
+			vimeo.OptSort("date"),
+			vimeo.OptDirection("asc"),
+			vimeo.OptPerPage(100),
+			vimeo.OptPage(page),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("listing videos in %s page %d: %w", folderURI, page, err)
+		}
+		all = append(all, vids...)
+		if resp.NextPage == "" {
+			break
+		}
+	}
+	return all, nil
+}
+
+// listAllFolderItems paginates through all items (videos + sub-folders) in a
+// folder via the /items endpoint, stopping when the API signals no next page.
+func listAllFolderItems(client *vimeo.Client, folderURI string) ([]*vimeo.FolderItem, error) {
+	var all []*vimeo.FolderItem
+	for page := 1; ; page++ {
+		items, resp, err := client.Users.ListFolderItems(
+			folderURI,
+			vimeo.OptPerPage(100),
+			vimeo.OptPage(page),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("listing items in %s page %d: %w", folderURI, page, err)
+		}
+		all = append(all, items...)
+		if resp.NextPage == "" {
+			break
+		}
+	}
+	return all, nil
+}
+
+// walkFolder recursively traverses a folder and all its sub-folders,
+// appending a videoInfo entry for every video found.
+//
+// Videos are fetched via {folderURI}/videos (returns full download metadata).
+// Sub-folders are discovered via {folderURI}/items filtered to type "folder".
+func walkFolder(client *vimeo.Client, folder *vimeo.Folder, parentPath string, results *[]videoInfo) error {
+	var currentPath string
+	if parentPath == "" {
+		currentPath = folder.Name
+	} else {
+		currentPath = parentPath + " / " + folder.Name
+	}
+
+	log.Printf("Walking folder: %s", currentPath)
+
+	// Collect videos in this folder (full metadata including download links).
+	videos, err := listAllFolderVideos(client, folder.URI)
+	if err != nil {
+		return err
+	}
+	for _, video := range videos {
+		link, mimeType, size, quality := extractSourceInfo(video)
+		if quality == "" {
+			log.Printf("  WARNING: no downloadable renditions for %q (%s)", video.Name, video.URI)
+		}
+		*results = append(*results, videoInfo{
+			FolderPath:    currentPath,
+			Name:          video.Name,
+			UploadedAt:    video.CreatedTime,
+			SourceSize:    size,
+			SourceLink:    link,
+			SourceType:    mimeType,
+			SourceQuality: quality,
+			VideoURI:      video.URI,
+		})
+	}
+
+	// Discover sub-folders via the /items endpoint (the /folders sub-path
+	// does not exist in Vimeo's API).
+	items, err := listAllFolderItems(client, folder.URI)
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		if item.Type == "folder" && item.Folder != nil {
+			if err := walkFolder(client, item.Folder, currentPath, results); err != nil {
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 
 func main() {
-	// flags for the username and password for Vimeo, and also the Iconik APPID and AuthToken
-	flag.StringVar(&vimeoAccessToken, "vimeo-access-token", "7057388dadfc5cfa11f44886450bc5d9", "Vimeo access token")
+	flag.StringVar(&vimeoAccessToken, "vimeo-access-token", "", "Vimeo access token")
 	flag.StringVar(&iconikAppID, "iconik-appid", "", "Iconik App ID")
 	flag.StringVar(&iconikAuthToken, "iconik-auth-token", "", "Iconik Auth Token")
+	flag.BoolVar(&debugHTTP, "debug", false, "Log outgoing HTTP Authorization headers")
 	flag.Parse()
-	// client identifier: c0513fafcbc871f615c846a8f3718572e774c7a6
 
-	/*	if vimeoUsername == "" || vimeoPassword == "" || iconikAppID == "" || iconikAuthToken == "" {
-		fmt.Println("Usage: go run main.go --vimeo-username <username> --vimeo-password <password> --iconik-appid <appid> --iconik-auth-token <auth-token>")
-		os.Exit(1)
-	} */
-	// make a request to Vimeo to get
+	if vimeoAccessToken == "" {
+		log.Fatal("--vimeo-access-token is required")
+	}
+
+	// Build the base HTTP transport. When --debug is set, wrap it so we can
+	// see the Authorization header that the oauth2 layer injects.
+	var baseTransport http.RoundTripper = http.DefaultTransport
+	if debugHTTP {
+		baseTransport = &debugTransport{base: http.DefaultTransport}
+	}
+
+	// Inject our (optionally debug-wrapped) transport as the base inside the
+	// oauth2 client, so oauth2 adds its Bearer header on top of it.
+	baseCtx := context.WithValue(context.Background(), oauth2.HTTPClient,
+		&http.Client{Transport: baseTransport})
 
 	ts := oauth2.StaticTokenSource(
 		&oauth2.Token{AccessToken: vimeoAccessToken},
 	)
-	tc := oauth2.NewClient(oauth2.NoContext, ts)
+	tc := oauth2.NewClient(baseCtx, ts)
 
 	client := vimeo.NewClient(tc, nil)
 
-	pageNum := 1
-	videos := 0
-	for {
-		log.Printf("Fetching page %d of videos from Vimeo...\n", pageNum)
-		vids, _, err := client.Videos.MyList(vimeo.OptSort("alphabetical"), vimeo.OptDirection("asc"), vimeo.OptPerPage(100), vimeo.OptPage(pageNum))
-		if err != nil {
-			vids, _, err = client.Videos.MyList(vimeo.OptSort("alphabetical"), vimeo.OptDirection("asc"), vimeo.OptPerPage(100), vimeo.OptPage(pageNum))
-			if err != nil {
-				fmt.Println("Error fetching videos from Vimeo:", err)
-				os.Exit(1)
-			}
-		}
-		pageNum++
+	log.Println("Fetching root folders from Vimeo Team Library...")
+	rootFolders, err := listAllRootFolders(client)
+	if err != nil {
+		log.Fatalf("Error fetching root folders: %v", err)
+	}
+	log.Printf("Found %d root folder(s).\n", len(rootFolders))
 
-		if len(vids) == 0 {
-			log.Println("No more videos found.")
-			break
-		}
-
-		for _, video := range vids {
-			sourceSize := 0
-			sourceWidth := 0
-			quality := ""
-			foundSource := false
-			//			spew.Dump(video)
-			for _, dl := range video.Download {
-				if dl.Quality == "source" {
-					log.Printf("Video Name: %s, size: %d\n", video.Name, dl.Size) // can we also find out what folder it is in?
-					foundSource = true
-					videos++
-					/*					fmt.Printf("Downloading video from URL: %s\n", dl.Link)
-										if err := downloadVideo(dl.Link, video.Name, dl.Type); err == nil {
-											log.Printf("Video %s downloaded successfully.\n", video.Name)
-										} */
-					break
-				}
-				if dl.Width > sourceWidth {
-					quality = dl.Quality
-					sourceSize = dl.Size
-					sourceWidth = dl.Width
-				}
-			}
-			if !foundSource {
-				if sourceSize > 0 {
-					log.Printf("Video Name [%s]: %s, size: %d\n", quality, video.Name, sourceSize) // can we also find out what folder it is in?
-					videos++
-				} else {
-					log.Printf("No source quality video found for %s, only had %v\n", video.Name)
-				}
-			}
+	var allVideos []videoInfo
+	for _, folder := range rootFolders {
+		if err := walkFolder(client, folder, "", &allVideos); err != nil {
+			log.Printf("Warning: error walking folder %q: %v", folder.Name, err)
 		}
 	}
-	log.Printf("Total videos processed: %d\n", videos)
+
+	// Print the inventory to stdout.
+	fmt.Println()
+	fmt.Println("=== Vimeo Team Library — Video Inventory ===")
+	fmt.Println()
+	totalBytes := 0
+
+	for i, v := range allVideos {
+		totalBytes += v.SourceSize
+		qualityNote := ""
+		if v.SourceQuality != "source" && v.SourceQuality != "" {
+			qualityNote = fmt.Sprintf(" [best available: %s]", v.SourceQuality)
+		}
+		fmt.Printf("%4d. %s\n", i+1, v.Name)
+		fmt.Printf("      Folder:   %s\n", v.FolderPath)
+		fmt.Printf("      Uploaded: %s\n", v.UploadedAt.Format("2006-01-02"))
+		fmt.Printf("      Size:     %s%s\n", humanSize(v.SourceSize), qualityNote)
+		fmt.Println()
+	}
+	fmt.Printf("=== Total: %d videos ===\n", len(allVideos))
+	fmt.Printf("=== Total size: %s ===\n", humanSize(totalBytes))
 }
