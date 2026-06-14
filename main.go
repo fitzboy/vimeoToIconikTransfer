@@ -279,7 +279,6 @@ func findOrCreateSubCollection(ic *iconik.IClient, parentID, name string) (strin
 		}
 	}
 	// Not found — create it.
-	log.Fatalf("done here, had %d\n", len(results.Objects))
 	log.Printf("    Creating sub-collection %q under %s", name, parentID)
 	id, err := ic.CreateCollection(name, parentID)
 	if err != nil {
