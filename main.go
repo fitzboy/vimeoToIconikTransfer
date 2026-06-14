@@ -1,15 +1,21 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha1"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
+	iconik "github.com/jzhang919/iconikclient2"
 	"github.com/silentsokolov/go-vimeo/vimeo"
 	"golang.org/x/oauth2"
 )
@@ -17,7 +23,12 @@ import (
 var vimeoAccessToken string
 var iconikAppID string
 var iconikAuthToken string
+var iconikRootCollection string
 var debugHTTP bool
+
+// collectionCache maps "baseCollectionID::folder/path" → iconik collection UUID
+// so that repeated walks of the same path do not make redundant API calls.
+var collectionCache map[string]string
 
 // debugTransport wraps an http.RoundTripper and logs the outgoing
 // Authorization header for every request. It is injected as the *base*
@@ -89,54 +100,21 @@ func humanSize(bytes int) string {
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
-// downloadVideo downloads a video file from link to disk as name+extension.
-// Vimeo download links are pre-signed, but we include the bearer token as a
-// fallback. This function is unused in the current inventory phase but is
-// kept ready for the forthcoming download step.
-func downloadVideo(link, name, mime string) error {
-	req, err := http.NewRequest("GET", link, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "bearer "+vimeoAccessToken)
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("received status code %d", resp.StatusCode)
-	}
-
-	var extension string
-	switch mime {
-	case "video/mp4":
-		extension = ".mp4"
-	case "video/quicktime":
-		extension = ".mov"
-	default:
-		return fmt.Errorf("unsupported video type: %s", mime)
-	}
-
-	outFile, err := os.Create(name + extension)
-	if err != nil {
-		return fmt.Errorf("error creating file: %w", err)
-	}
-	defer outFile.Close()
-
-	if _, err = io.Copy(outFile, resp.Body); err != nil {
-		return fmt.Errorf("error writing to file: %w", err)
-	}
-
-	return nil
+// sanitizeFilename replaces characters that are problematic in filenames or
+// B2 object names with underscores.
+func sanitizeFilename(name string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '/', '\\', ':', '*', '?', '"', '<', '>', '|', '\x00':
+			return '_'
+		}
+		return r
+	}, name)
 }
 
-// listAllRootFolders paginates through all root-level folders for the
-// authenticated user, stopping when the API signals no next page.
-func listAllRootFolders(client *vimeo.Client) ([]*vimeo.Folder, error) {
+// listAllFolders paginates through all folders for the authenticated user
+// (the Vimeo API returns every folder regardless of nesting level).
+func listAllFolders(client *vimeo.Client) ([]*vimeo.Folder, error) {
 	var all []*vimeo.Folder
 	for page := 1; ; page++ {
 		folders, resp, err := client.Users.ListFolders(
@@ -145,7 +123,7 @@ func listAllRootFolders(client *vimeo.Client) ([]*vimeo.Folder, error) {
 			vimeo.OptPage(page),
 		)
 		if err != nil {
-			return nil, fmt.Errorf("listing root folders page %d: %w", page, err)
+			return nil, fmt.Errorf("listing folders page %d: %w", page, err)
 		}
 		all = append(all, folders...)
 		if resp.NextPage == "" {
@@ -180,14 +158,13 @@ func listAllFolderVideos(client *vimeo.Client, folderURI string) ([]*vimeo.Video
 
 // listAllFolderItems paginates through all items (videos + sub-folders) in a
 // folder via the /items endpoint, stopping when the API signals no next page.
-func listAllFolderItems(client *vimeo.Client, folderURI string) ([]*vimeo.FolderItem, error) {
+// Extra CallOptions (e.g. vimeo.OptFilter("folder")) are appended after the
+// mandatory page/per_page options.
+func listAllFolderItems(client *vimeo.Client, folderURI string, extra ...vimeo.CallOption) ([]*vimeo.FolderItem, error) {
 	var all []*vimeo.FolderItem
 	for page := 1; ; page++ {
-		items, resp, err := client.Users.ListFolderItems(
-			folderURI,
-			vimeo.OptPerPage(100),
-			vimeo.OptPage(page),
-		)
+		opts := append([]vimeo.CallOption{vimeo.OptPerPage(100), vimeo.OptPage(page)}, extra...)
+		items, resp, err := client.Users.ListFolderItems(folderURI, opts...)
 		if err != nil {
 			return nil, fmt.Errorf("listing items in %s page %d: %w", folderURI, page, err)
 		}
@@ -197,6 +174,32 @@ func listAllFolderItems(client *vimeo.Client, folderURI string) ([]*vimeo.Folder
 		}
 	}
 	return all, nil
+}
+
+// findRootFolders identifies which folders in allFolders are true root-level
+// folders — those that do not appear as a sub-folder of any other folder.
+// It calls listAllFolderItems with filter=folder for each folder, which is
+// cheaper than fetching all items (videos are excluded from the response).
+func findRootFolders(client *vimeo.Client, allFolders []*vimeo.Folder) ([]*vimeo.Folder, error) {
+	childURIs := make(map[string]bool)
+	for _, f := range allFolders {
+		items, err := listAllFolderItems(client, f.URI, vimeo.OptFilter("folder"))
+		if err != nil {
+			return nil, fmt.Errorf("listing sub-folders of %q: %w", f.Name, err)
+		}
+		for _, item := range items {
+			if item.Type == "folder" && item.Folder != nil {
+				childURIs[item.Folder.URI] = true
+			}
+		}
+	}
+	var roots []*vimeo.Folder
+	for _, f := range allFolders {
+		if !childURIs[f.URI] {
+			roots = append(roots, f)
+		}
+	}
+	return roots, nil
 }
 
 // walkFolder recursively traverses a folder and all its sub-folders,
@@ -253,10 +256,331 @@ func walkFolder(client *vimeo.Client, folder *vimeo.Folder, parentPath string, r
 	return nil
 }
 
+// findOrCreateSubCollection searches for a collection with the given name that
+// is a direct child of parentID. If found, its UUID is returned; otherwise a
+// new sub-collection is created and its UUID returned.
+func findOrCreateSubCollection(ic *iconik.IClient, parentID, name string) (string, error) {
+	results, err := ic.SearchWithTitleAndTag(name, "", true)
+	if err != nil {
+		return "", fmt.Errorf("searching for collection %q: %w", name, err)
+	}
+	// Filter to an exact title match whose parent is parentID.
+	for _, obj := range results.Objects {
+		if obj.Title != name {
+			log.Printf("checking title %s against %s\n", obj.Title, name)
+			continue
+		}
+		for _, p := range obj.InCollections {
+			log.Printf("checking parent %s against %s\n", p, parentID)
+			if p == parentID {
+				log.Printf("    Found existing collection %q (id=%s)", name, obj.Id)
+				return obj.Id, nil
+			}
+		}
+	}
+	// Not found — create it.
+	log.Fatalf("done here, had %d\n", len(results.Objects))
+	log.Printf("    Creating sub-collection %q under %s", name, parentID)
+	id, err := ic.CreateCollection(name, parentID)
+	if err != nil {
+		return "", fmt.Errorf("creating collection %q: %w", name, err)
+	}
+	return id, nil
+}
+
+// ensureCollectionPath walks the segments of folderPath (split on " / "),
+// finding or creating each level of sub-collection under baseCollectionID.
+// Results are cached so repeated calls for the same path are cheap.
+// Returns the UUID of the deepest (leaf) collection.
+func ensureCollectionPath(ic *iconik.IClient, baseCollectionID, folderPath string) (string, error) {
+	segments := strings.Split(folderPath, " / ")
+	currentID := baseCollectionID
+	currentPath := ""
+	for _, seg := range segments {
+		if seg == "" {
+			continue
+		}
+		if currentPath == "" {
+			currentPath = seg
+		} else {
+			currentPath = currentPath + " / " + seg
+		}
+		cacheKey := baseCollectionID + "::" + currentPath
+		if id, ok := collectionCache[cacheKey]; ok {
+			currentID = id
+			continue
+		}
+		id, err := findOrCreateSubCollection(ic, currentID, seg)
+		if err != nil {
+			return "", fmt.Errorf("ensuring collection path %q: %w", currentPath, err)
+		}
+		collectionCache[cacheKey] = id
+		currentID = id
+	}
+	return currentID, nil
+}
+
+// videoAlreadyUploaded returns true if an asset with exactly the given title
+// already exists inside collectionID in Iconik AND its completed file size
+// matches expectedSize. A partial upload (file record not yet CLOSED) returns
+// false even if the title matches, so the upload will be retried.
+func videoAlreadyUploaded(ic *iconik.IClient, title string, expectedSize int64, collectionID string) (bool, error) {
+	results, err := ic.SearchWithTitleAndTag(title, "", false)
+	if err != nil {
+		return false, fmt.Errorf("searching for existing asset %q: %w", title, err)
+	}
+	log.Printf("searched with '%s' and got %d results\n", title, len(results.Objects))
+	for _, obj := range results.Objects {
+		log.Printf("checking title %s matches %s\n", obj.Title, title)
+		if obj.Title != title {
+			continue
+		}
+		for _, c := range obj.InCollections {
+			log.Printf("  checking collection %s matches %s\n", c, collectionID)
+			if c == collectionID {
+				// Title and collection match — verify the upload completed at the right size.
+				size, err := ic.GetAssetFileSize(obj.Id)
+				if err != nil {
+					return false, fmt.Errorf("checking file size for %q: %w", title, err)
+				}
+				log.Printf("  checking file size %d matches expected %d\n", size, expectedSize)
+				if size == expectedSize {
+					return true, nil
+				}
+				// Size 0 means no CLOSED file record — partial upload.
+				// Any other value means a different file landed here.
+				log.Printf("  Found asset %q but size mismatch (iconik=%d, expected=%d)", title, size, expectedSize)
+			}
+		}
+	}
+	return false, nil
+}
+
+// uploadSinglePart streams all bytes from body and uploads them to B2 in a
+// single request. Used for files at or below the multipart threshold (100 MB).
+func uploadSinglePart(NAU *iconik.NewAssetUpload, body io.Reader) error {
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return fmt.Errorf("reading source bytes: %w", err)
+	}
+	hasher := sha1.New()
+	hasher.Write(data)
+	sha1Hash := fmt.Sprintf("%x", hasher.Sum(nil))
+
+	req, err := http.NewRequest(http.MethodPost, NAU.UploadURL, bytes.NewBuffer(data))
+	if err != nil {
+		return fmt.Errorf("building B2 request: %w", err)
+	}
+	req.Header.Set("Authorization", NAU.UploadAuthToken)
+	req.Header.Set("X-Bz-File-Name", url.PathEscape(NAU.UploadFilename))
+	req.Header.Set("X-Bz-Content-Sha1", sha1Hash)
+	req.Header.Set("Content-Type", NAU.MimeType)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("posting to B2: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("reading B2 response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("B2 returned status %d: %s", resp.StatusCode, respBody)
+	}
+	return nil
+}
+
+// uploadMultipart reads body in 100 MB chunks and uploads each as a numbered
+// B2 multipart part. SHA-1 digests collected during upload are stored into
+// NAU.Sha1List so that FinishMultipartUpload can complete the session.
+func uploadMultipart(NAU *iconik.NewAssetUpload, body io.Reader) error {
+	buf := make([]byte, iconik.MULTIPART_FILESIZE_THRESHOLD)
+	var shas []string
+
+	for partNum := 1; ; partNum++ {
+		n, readErr := io.ReadFull(body, buf)
+		if n == 0 {
+			break
+		}
+		chunk := buf[:n]
+
+		hasher := sha1.New()
+		hasher.Write(chunk)
+		sha1Hash := fmt.Sprintf("%x", hasher.Sum(nil))
+
+		req, err := http.NewRequest(http.MethodPost, NAU.UploadURL, bytes.NewBuffer(chunk))
+		if err != nil {
+			return fmt.Errorf("building B2 request for part %d: %w", partNum, err)
+		}
+		req.ContentLength = int64(n)
+		req.Header.Set("Authorization", NAU.UploadAuthToken)
+		req.Header.Set("X-Bz-Part-Number", fmt.Sprintf("%d", partNum))
+		req.Header.Set("X-Bz-Content-Sha1", sha1Hash)
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("posting part %d: %w", partNum, err)
+		}
+		respBody, readBodyErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readBodyErr != nil {
+			return fmt.Errorf("reading B2 response for part %d: %w", partNum, readBodyErr)
+		}
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("B2 returned status %d for part %d: %s", resp.StatusCode, partNum, respBody)
+		}
+
+		type partResp struct {
+			ContentSha1 string `json:"contentSha1"`
+		}
+		var pr partResp
+		if err := json.Unmarshal(respBody, &pr); err != nil {
+			return fmt.Errorf("parsing B2 part response for part %d: %w", partNum, err)
+		}
+		shas = append(shas, pr.ContentSha1)
+		log.Printf("    Uploaded part %d (%s)", partNum, humanSize(n))
+
+		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
+			break
+		} else if readErr != nil {
+			return fmt.Errorf("reading source for part %d: %w", partNum, readErr)
+		}
+	}
+
+	NAU.Sha1List = shas
+	return nil
+}
+
+// transferVideoToIconik creates an Iconik asset for info inside the given
+// collection, streams the file from Vimeo's pre-signed URL into a local temp
+// file, then uploads that temp file to Backblaze B2 via Iconik-provided
+// credentials and finalises the asset.
+//
+// Saving to the temp file is retried immediately on network error so that a
+// mid-stream Vimeo connection drop does not abort the whole transfer.
+// If the B2 upload fails, the function waits 10 s then retries using the
+// already-downloaded temp file (no second Vimeo fetch needed).
+func transferVideoToIconik(ic *iconik.IClient, info videoInfo, collectionID string) error {
+	if info.SourceLink == "" {
+		return fmt.Errorf("no download URL available for %q", info.Name)
+	}
+
+	ext := ".mp4"
+	if info.SourceType == "video/quicktime" {
+		ext = ".mov"
+	}
+	fileName := sanitizeFilename(info.Name) + ext
+	collectionPrefix := strings.TrimPrefix(iconikRootCollection, "/")
+	storagePath := collectionPrefix + "/" + strings.ReplaceAll(info.FolderPath, " / ", "/")
+
+	// Create a temp file to hold the downloaded video.
+	tmp, err := os.CreateTemp("", "vimeo-upload-*.tmp")
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	defer func() {
+		tmp.Close()
+		os.Remove(tmp.Name())
+	}()
+
+	// downloadToTemp fetches the video from Vimeo and streams it into tmp,
+	// retrying the entire fetch immediately on any network-level error
+	// (including mid-stream drops). The temp file is truncated and rewound
+	// before each attempt so partial writes don't accumulate.
+	downloadToTemp := func() error {
+		log.Printf("  Fetching from Vimeo (%s)...", humanSize(info.SourceSize))
+		for {
+			req, err := http.NewRequest(http.MethodGet, info.SourceLink, nil)
+			if err != nil {
+				return fmt.Errorf("building Vimeo request: %w", err)
+			}
+			req.Header.Set("Authorization", "bearer "+vimeoAccessToken)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				log.Printf("  Vimeo fetch error, retrying immediately: %v", err)
+				continue
+			}
+			if resp.StatusCode != http.StatusOK {
+				resp.Body.Close()
+				return fmt.Errorf("Vimeo returned status %d for download URL", resp.StatusCode)
+			}
+			log.Printf("  Fetched response (Content-Length: %d of %d), saving to temp file %s...", resp.ContentLength, info.SourceSize, tmp.Name())
+			if err := tmp.Truncate(0); err != nil {
+				resp.Body.Close()
+				return fmt.Errorf("truncating temp file: %w", err)
+			}
+			if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+				resp.Body.Close()
+				return fmt.Errorf("seeking temp file: %w", err)
+			}
+			_, copyErr := io.Copy(tmp, resp.Body)
+			resp.Body.Close()
+			if copyErr != nil {
+				log.Printf("  Error saving to temp file, retrying immediately: %v", copyErr)
+				continue
+			}
+			return nil
+		}
+	}
+
+	if err := downloadToTemp(); err != nil {
+		return err
+	}
+	log.Printf("  Download complete, creating Iconik asset stub...")
+
+	const maxUploadAttempts = 2
+	var lastErr error
+	for attempt := 1; attempt <= maxUploadAttempts; attempt++ {
+		if attempt > 1 {
+			log.Printf("  Upload failed, waiting 10s before retry...")
+			time.Sleep(10 * time.Second)
+		}
+
+		// Rewind the temp file for this attempt.
+		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("seeking temp file: %w", err)
+		}
+
+		NAU, err := ic.MakeNewAsset(
+			collectionID,
+			fileName,
+			info.Name,
+			storagePath,
+			info.SourceType,
+			int64(info.SourceSize),
+			info.UploadedAt,
+		)
+		if err != nil {
+			return fmt.Errorf("MakeNewAsset: %w", err)
+		}
+
+		multipart := NAU.MultipartFileID != ""
+		log.Printf("  Uploading to B2 (multipart=%v)...", multipart)
+		if multipart {
+			lastErr = uploadMultipart(NAU, tmp)
+		} else {
+			lastErr = uploadSinglePart(NAU, tmp)
+		}
+		if lastErr != nil {
+			log.Printf("  Upload attempt %d failed: %v", attempt, lastErr)
+			continue
+		}
+
+		log.Printf("  Finalising asset...")
+		if err := ic.FinishUpload(NAU); err != nil {
+			return fmt.Errorf("FinishUpload: %w", err)
+		}
+		return nil
+	}
+	return fmt.Errorf("upload: %w", lastErr)
+}
+
 func main() {
 	flag.StringVar(&vimeoAccessToken, "vimeo-access-token", "", "Vimeo access token")
 	flag.StringVar(&iconikAppID, "iconik-appid", "", "Iconik App ID")
 	flag.StringVar(&iconikAuthToken, "iconik-auth-token", "", "Iconik Auth Token")
+	flag.StringVar(&iconikRootCollection, "iconik-collection", "", "Iconik root collection name to copy videos into")
 	flag.BoolVar(&debugHTTP, "debug", false, "Log outgoing HTTP Authorization headers")
 	flag.Parse()
 
@@ -283,15 +607,24 @@ func main() {
 
 	client := vimeo.NewClient(tc, nil)
 
-	log.Println("Fetching root folders from Vimeo Team Library...")
-	rootFolders, err := listAllRootFolders(client)
+	log.Println("Fetching all folders from Vimeo...")
+	allFolders, err := listAllFolders(client)
 	if err != nil {
-		log.Fatalf("Error fetching root folders: %v", err)
+		log.Fatalf("Error fetching folders: %v", err)
 	}
-	log.Printf("Found %d root folder(s).\n", len(rootFolders))
+	log.Printf("Found %d folder(s) total; identifying root level...", len(allFolders))
+	roots, err := findRootFolders(client, allFolders)
+	if err != nil {
+		log.Fatalf("Error finding root folders: %v", err)
+	}
+	log.Printf("Found %d root folder(s).\n", len(roots))
+
+	for _, folder := range roots {
+		log.Printf("root folder  - %s (URI: %s)\n", folder.Name, folder.URI)
+	}
 
 	var allVideos []videoInfo
-	for _, folder := range rootFolders {
+	for _, folder := range roots {
 		if err := walkFolder(client, folder, "", &allVideos); err != nil {
 			log.Printf("Warning: error walking folder %q: %v", folder.Name, err)
 		}
@@ -317,4 +650,82 @@ func main() {
 	}
 	fmt.Printf("=== Total: %d videos ===\n", len(allVideos))
 	fmt.Printf("=== Total size: %s ===\n", humanSize(totalBytes))
+
+	// --- Iconik transfer phase ---
+	if iconikAppID == "" || iconikAuthToken == "" || iconikRootCollection == "" {
+		log.Println("Iconik credentials not provided (--iconik-appid, --iconik-auth-token, --iconik-collection). Skipping upload.")
+		os.Exit(0)
+	}
+
+	log.Println("Connecting to Iconik...")
+	ic, err := iconik.NewIClient(iconik.Credentials{
+		AppID: iconikAppID,
+		Token: iconikAuthToken,
+	}, "", false)
+	if err != nil {
+		log.Fatalf("Failed to create Iconik client: %v", err)
+	}
+
+	log.Printf("Looking up root collection %q in Iconik...", iconikRootCollection)
+	// The user may supply a full path like "/Ministries/International/Vimeo".
+	// GetCollectionIDs searches by name, so we pass only the leaf segment, then
+	// filter the results to the one whose full path matches.
+	collectionPath := strings.TrimPrefix(iconikRootCollection, "/")
+	parts := strings.Split(collectionPath, "/")
+	leafName := parts[len(parts)-1]
+
+	allResults, err := ic.GetCollectionIDs(leafName)
+	if err != nil {
+		log.Fatalf("Failed to search for collection: %v", err)
+	}
+	var matched []*iconik.CollectionResult
+	for _, r := range allResults {
+		if r.Path == collectionPath {
+			matched = append(matched, r)
+		}
+	}
+	switch len(matched) {
+	case 0:
+		log.Fatalf("No collection found with path %q — create it in Iconik first", collectionPath)
+	case 1:
+		// exactly one match — good
+	default:
+		log.Fatalf("Ambiguous: %d collections share the path %q — expected exactly one", len(matched), collectionPath)
+	}
+	rootCollectionID := matched[0].CollectionID
+	log.Printf("Using root collection %q (id=%s)", matched[0].Path, rootCollectionID)
+	collectionCache = make(map[string]string)
+
+	log.Printf("Starting transfer of %d videos...", len(allVideos))
+	failed := 0
+	for i, v := range allVideos {
+		log.Printf("[%d/%d] %s  (folder: %s)", i+1, len(allVideos), v.Name, v.FolderPath)
+
+		collectionID, err := ensureCollectionPath(ic, rootCollectionID, v.FolderPath)
+		if err != nil {
+			log.Printf("  ERROR ensuring collection path: %v — skipping", err)
+			failed++
+			continue
+		}
+
+		exists, err := videoAlreadyUploaded(ic, v.Name, int64(v.SourceSize), collectionID)
+		if err != nil {
+			log.Printf("  WARNING: could not check for existing asset: %v — proceeding with upload", err)
+		} else if exists {
+			log.Printf("  Already in Iconik — skipping")
+			continue
+		}
+		if err := transferVideoToIconik(ic, v, collectionID); err != nil {
+			log.Printf("  ERROR transferring video: %v — skipping", err)
+			failed++
+			continue
+		}
+		log.Printf("  OK")
+	}
+
+	if failed > 0 {
+		log.Printf("Transfer complete. %d succeeded, %d failed.", len(allVideos)-failed, failed)
+	} else {
+		log.Printf("Transfer complete. All %d videos transferred successfully.", len(allVideos))
+	}
 }
