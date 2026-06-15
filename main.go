@@ -16,7 +16,7 @@ import (
 	"time"
 
 	iconik "github.com/jzhang919/iconikclient2"
-	"github.com/silentsokolov/go-vimeo/vimeo"
+	"github.com/silentsokolov/go-vimeo/v2/vimeo"
 	"golang.org/x/oauth2"
 )
 

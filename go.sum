@@ -1,6 +1,6 @@
-github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
-github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/silentsokolov/go-vimeo v2.2.2+incompatible h1:WsbTmSadc2GoViCY5ucneDdVqETNYnvR6yg0Gi0Viws=
-github.com/silentsokolov/go-vimeo v2.2.2+incompatible/go.mod h1:10FeaKUMy5t3KLsYfy54dFrq0rpwcfyKkKcF7vRGIRY=
+github.com/jzhang919/iconikclient2 v0.0.0-20260614204033-17a2372bb372 h1:vNB/CA1bslOI6HNijIJ55s2SuN+EPTutHLc9u/6Sfjo=
+github.com/jzhang919/iconikclient2 v0.0.0-20260614204033-17a2372bb372/go.mod h1:dSFdnLLhYFkdJr0XwANxGBe+oltuDkZJNj3vGv2od+M=
+github.com/silentsokolov/go-vimeo/v2 v2.2.4-0.20260615134137-9b0a2007f291 h1:v94NejebiSXzmLqyPYgEwjbEt4/Vv2fjMT3CiUPzw14=
+github.com/silentsokolov/go-vimeo/v2 v2.2.4-0.20260615134137-9b0a2007f291/go.mod h1:tf9i434evbx4xA93U3J56FpmcWH3dlo1cjB77rTuBD4=
 golang.org/x/oauth2 v0.30.0 h1:dnDm7JmhM45NNpd8FDDeLhK6FwqbOf4MLCM9zb1BOHI=
 golang.org/x/oauth2 v0.30.0/go.mod h1:B++QgG3ZKulg6sRPGD/mqlHQs5rB3Ml9erfeDY7xKlU=
